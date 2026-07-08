@@ -47,6 +47,11 @@ from gridplayer.widgets.video_status import VideoStatus
 
 IN_PROGRESS_THRESHOLD_MS = 500
 
+STREAM_RETRY_ENABLED = True
+STREAM_RETRY_MAX_ATTEMPTS = 0        # 0 = 无限重试；>0 = 最多重试次数
+STREAM_RETRY_DELAY_BASE_MS = 3000    # 首次重试延迟（毫秒）
+STREAM_RETRY_DELAY_MAX_MS = 60000    # 退避延迟上限（毫秒）
+STREAM_RETRY_BACKOFF = 2.0           # 指数退避倍数：3s → 6s → 12s ... 封顶 60s
 
 class QStackedLayoutFloating(QStackedLayout):
     """overridden setGeometry for children is not honored due to type casting inside Qt,
@@ -188,6 +193,11 @@ class VideoBlock(QWidget):
 
         self._reload_timer = QTimer(self)
         self._reload_timer.timeout.connect(self.reload)
+        
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._stream_retry_reload)
+        self._retry_count = 0
 
         self.url_resolver = self.init_url_resolver()
         self.video_driver = self.init_video_driver()
@@ -316,6 +326,7 @@ class VideoBlock(QWidget):
         raise PlayerException(traceback_txt)
 
     def cleanup(self):
+        self._retry_timer.stop()
         self.overlay_hide_timer.stop()
         self._in_progress_timer.stop()
 
@@ -344,7 +355,40 @@ class VideoBlock(QWidget):
         self._is_error = True
         self.set_status("network-error")
         self.cleanup()
+        self._schedule_stream_retry()
 
+    def _schedule_stream_retry(self):
+        if not STREAM_RETRY_ENABLED:
+            return
+        uri = self.video_params.uri if self.video_params else "?"
+        if STREAM_RETRY_MAX_ATTEMPTS and self._retry_count >= STREAM_RETRY_MAX_ATTEMPTS:
+            self._log.error(
+                f"{self.id}: stream disconnected, giving up after "
+                f"{self._retry_count} retries | {uri}"
+            )
+            return
+        delay_ms = min(
+            int(STREAM_RETRY_DELAY_BASE_MS * (STREAM_RETRY_BACKOFF ** self._retry_count)),
+            STREAM_RETRY_DELAY_MAX_MS,
+        )
+        self._retry_count += 1
+        self._log.warning(
+            f"{self.id}: stream disconnected, scheduling retry #{self._retry_count} "
+            f"in {delay_ms / 1000:.1f}s | {uri}"
+        )
+        self.update_status(
+            translate("Video Status", "Reconnecting")
+            + f" #{self._retry_count} ({delay_ms // 1000}s)"
+        )
+        self._retry_timer.start(delay_ms)
+        
+    def _stream_retry_reload(self):
+        uri = self.video_params.uri if self.video_params else "?"
+        self._log.warning(
+            f"{self.id}: reconnecting stream now, attempt #{self._retry_count} | {uri}"
+        )
+        self.reload()
+        
     def set_status(self, status):
         self.overlay.hide()
         self.video_driver.hide()
@@ -358,6 +402,7 @@ class VideoBlock(QWidget):
         self.video_status.percent = percent
 
     def reload(self):
+        self._retry_timer.stop()
         self.is_live = False
         self._is_error = False
         self.streams = Streams()
@@ -777,6 +822,13 @@ class VideoBlock(QWidget):
     def load_video_finish(self):
         # final verdict belongs to VLC
         self.is_live = self.video_driver.is_live
+
+        if self._retry_count:
+            self._log.warning(
+                f"{self.id}: stream reconnected after {self._retry_count} "
+                f"retry(ies) | {self.video_params.uri}"
+            )
+            self._retry_count = 0
 
         if self._default_title is None:
             self._default_title = self.video_params.uri_name
